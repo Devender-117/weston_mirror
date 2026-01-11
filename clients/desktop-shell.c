@@ -55,9 +55,33 @@
 
 #include "tablet-unstable-v2-client-protocol.h"
 #include "weston-desktop-shell-client-protocol.h"
-
+#include <gbm.h>
+#include <drm_fourcc.h>
 #define DEFAULT_CLOCK_FORMAT CLOCK_FORMAT_MINUTES
 #define DEFAULT_SPACING 10
+
+#include "linux-dmabuf-unstable-v1-client-protocol.h"
+
+
+#include <pthread.h>
+
+static pthread_mutex_t wl_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void check_desktop_ready(struct window *window);
+
+ static struct zwp_linux_dmabuf_v1 *dmabuf_global = NULL;
+
+ static void registry_handler(void *data, struct wl_registry *registry,
+                              uint32_t id, const char *interface, uint32_t version) {
+     if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+         dmabuf_global = wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, 3);
+     }
+ }
+
+ static const struct wl_registry_listener registry_listener = {
+     registry_handler,
+     NULL
+ };
 
 enum clock_format {
 	CLOCK_FORMAT_MINUTES,
@@ -166,6 +190,57 @@ struct unlock_dialog {
 	int button_focused;
 	int closing;
 	struct desktop *desktop;
+};
+
+
+static void params_success(void *data,
+                           struct zwp_linux_buffer_params_v1 *params,
+                           struct wl_buffer *buffer) {
+    struct background *background = data;
+    struct rectangle allocation;
+    widget_get_allocation(background->widget, &allocation);
+	pthread_mutex_lock(&wl_mutex);
+    wl_surface_attach(window_get_wl_surface(background->window), buffer, 0, 0);
+    wl_surface_damage(window_get_wl_surface(background->window), 0, 0,
+                      allocation.width, allocation.height);
+	//wl_surface_damage(window_get_wl_surface(background->window), 0, 0,
+                      //background->alloc_width, background->alloc_height);
+    wl_surface_commit(window_get_wl_surface(background->window));
+	pthread_mutex_unlock(&wl_mutex);
+
+    background->painted = 1;
+    check_desktop_ready(background->window);
+	fprintf(stderr, "DMA-BUF commit successful for background\n");
+    //cleanup
+	/*if (background->bo)
+		gbm_bo_destroy(background->bo);
+	if (background->gbm)
+		gbm_device_destroy(background->gbm);
+	if (background->dma_fd >= 0)
+		close(background->dma_fd);
+	if (background->drm_fd >= 0)
+		close(background->drm_fd);
+	
+	background->bo = NULL;
+    background->gbm = NULL;
+    background->dma_fd = -1;
+    background->drm_fd = -1;
+
+	zwp_linux_buffer_params_v1_destroy(params);*/
+
+}
+
+static void params_failed(void *data,
+                           struct zwp_linux_buffer_params_v1 *params) {
+    fprintf(stderr, "DMA-buf params failed");
+}
+/*| ../weston-13.0.1/clients/desktop-shell.c:1782:57: warning: 'params_listener' defined but not used [-Wunused-const-variable=]
+|  1782 | static const struct zwp_linux_buffer_params_v1_listener params_listener = {
+  listener function needs to be called.
+*/
+static const struct zwp_linux_buffer_params_v1_listener params_listener = {
+    params_success,
+    params_failed
 };
 
 static void
@@ -777,93 +852,117 @@ enum {
 	BACKGROUND_CENTERED
 };
 
+void *event_loop_thread(void *arg) {
+    struct wl_display *display = arg;
+    while (1) {
+        pthread_mutex_lock(&wl_mutex);
+        wl_display_dispatch(display);
+        pthread_mutex_unlock(&wl_mutex);
+    }
+    return NULL;
+}
+
+
 static void
 background_draw(struct widget *widget, void *data)
 {
-	struct background *background = data;
-	cairo_surface_t *surface, *image;
-	cairo_pattern_t *pattern;
-	cairo_matrix_t matrix;
-	cairo_t *cr;
-	double im_w, im_h;
-	double sx, sy, s;
-	double tx, ty;
-	struct rectangle allocation;
-
-	surface = window_get_surface(background->window);
-
-	cr = widget_cairo_create(background->widget);
-	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-	if (background->color == 0)
-		cairo_set_source_rgba(cr, 0.0, 0.0, 0.2, 1.0);
-	else
-		set_hex_color(cr, background->color);
-	cairo_paint(cr);
-
-	widget_get_allocation(widget, &allocation);
-	image = NULL;
-	if (background->image)
-		image = load_cairo_surface(background->image);
-	else if (background->color == 0) {
-		char *name = file_name_with_datadir("pattern.png");
-
-		image = load_cairo_surface(name);
-		free(name);
+	
+	if (!dmabuf_global) {
+		fprintf(stderr, "DMA-BUF global not available, fallback to SHM\n");
+		return;
 	}
 
-	if (image && background->type != -1) {
-		im_w = cairo_image_surface_get_width(image);
-		im_h = cairo_image_surface_get_height(image);
-		sx = im_w / allocation.width;
-		sy = im_h / allocation.height;
+    struct background *background = data;
+    fprintf(stderr, "background_draw using DMA-buf");
 
-		pattern = cairo_pattern_create_for_surface(image);
+    struct rectangle allocation;
+    widget_get_allocation(widget, &allocation);
+    int width = allocation.width;
+    int height = allocation.height;
+    if (width <= 0 || height <= 0) {
+        fprintf(stderr, "Invalid allocation size: %dx%d", width, height);
+        return;
+    }
 
-		switch (background->type) {
-		case BACKGROUND_SCALE:
-			cairo_matrix_init_scale(&matrix, sx, sy);
-			cairo_pattern_set_matrix(pattern, &matrix);
-			cairo_pattern_set_extend(pattern, CAIRO_EXTEND_PAD);
-			break;
-		case BACKGROUND_SCALE_CROP:
-			s = (sx < sy) ? sx : sy;
-			/* align center */
-			tx = (im_w - s * allocation.width) * 0.5;
-			ty = (im_h - s * allocation.height) * 0.5;
-			cairo_matrix_init_translate(&matrix, tx, ty);
-			cairo_matrix_scale(&matrix, s, s);
-			cairo_pattern_set_matrix(pattern, &matrix);
-			cairo_pattern_set_extend(pattern, CAIRO_EXTEND_PAD);
-			break;
-		case BACKGROUND_TILE:
-			cairo_pattern_set_extend(pattern, CAIRO_EXTEND_REPEAT);
-			break;
-		case BACKGROUND_CENTERED:
-			s = (sx < sy) ? sx : sy;
-			if (s < 1.0)
-				s = 1.0;
+    int drm_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    if (drm_fd < 0) { perror("open drm"); return; }
 
-			/* align center */
-			tx = (im_w - s * allocation.width) * 0.5;
-			ty = (im_h - s * allocation.height) * 0.5;
+    struct gbm_device *gbm = gbm_create_device(drm_fd);
+    if (!gbm) { fprintf(stderr, "Failed to create GBM device"); close(drm_fd); return; }
 
-			cairo_matrix_init_translate(&matrix, tx, ty);
-			cairo_matrix_scale(&matrix, s, s);
-			cairo_pattern_set_matrix(pattern, &matrix);
-			break;
-		}
+    struct gbm_bo *bo = gbm_bo_create(gbm, width, height, GBM_FORMAT_ARGB8888,
+                                      GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
 
-		cairo_set_source(cr, pattern);
-		cairo_pattern_destroy (pattern);
-		cairo_surface_destroy(image);
-		cairo_mask(cr, pattern);
+    if (!bo) { fprintf(stderr, "Failed GBM BO"); gbm_device_destroy(gbm); close(drm_fd); return; }
+
+    int dma_fd = gbm_bo_get_fd(bo);
+    if (dma_fd < 0) { fprintf(stderr, "Failed to get DMA-buf FD"); gbm_bo_destroy(bo); gbm_device_destroy(gbm); close(drm_fd); return; }
+
+    uint32_t stride = gbm_bo_get_stride(bo);
+    uint64_t modifier = gbm_bo_get_modifier(bo);
+
+    // NOTE: dmabuf_global must be bound from Wayland registry
+    struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(dmabuf_global);
+    if (!params) { fprintf(stderr, "Failed to create dmabuf params"); close(dma_fd); gbm_bo_destroy(bo); gbm_device_destroy(gbm); close(drm_fd); return; }
+
+    //zwp_linux_buffer_params_v1_add(params, dma_fd, 0, width, height, stride, 0, modifier);
+	uint32_t modifier_hi = modifier >> 32;
+	uint32_t modifier_lo = modifier & 0xffffffff;
+	pthread_mutex_lock(&wl_mutex);
+	fprintf(stderr, "Calling zwp_linux_buffer_params_v1_add\n");
+	zwp_linux_buffer_params_v1_add(params, dma_fd, 0, 0, stride, modifier_hi, modifier_lo);
+	fprintf(stderr, "Calling zwp_linux_buffer_params_v1_add_listener\n");
+	zwp_linux_buffer_params_v1_add_listener(params, &params_listener, background);
+	fprintf(stderr, "Calling zwp_linux_buffer_params_v1_create_immed\n");
+	struct wl_buffer *buffer = zwp_linux_buffer_params_v1_create_immed(params,
+								width,
+								height,
+								DRM_FORMAT_ARGB8888,
+								0);
+	pthread_mutex_unlock(&wl_mutex);
+	zwp_linux_buffer_params_v1_destroy(params); 
+	
+	if (!buffer) {
+    fprintf(stderr, "Failed to create wl_buffer\n");
+    goto cleanup;
 	}
 
-	cairo_destroy(cr);
-	cairo_surface_destroy(surface);
+	// Attach and commit
+	pthread_mutex_lock(&wl_mutex);
+	fprintf(stderr, "Calling wl_surface_attach\n");
+	wl_surface_attach(window_get_wl_surface(background->window), buffer, 0, 0);
+	fprintf(stderr, "Calling wl_surface_damage\n");
+	wl_surface_damage(window_get_wl_surface(background->window), 0, 0, width, height);
+	fprintf(stderr, "Calling wl_surface_commit\n");
+	wl_surface_commit(window_get_wl_surface(background->window));
+	fprintf(stderr, "return from wl_surface_commit\n");
+	pthread_mutex_unlock(&wl_mutex);
 
-	background->painted = 1;
-	check_desktop_ready(background->window);
+	//use if dma buffer is required synchronously.
+	//zwp_linux_buffer_params_v1_create(params, width, height, DRM_FORMAT_XRGB8888, 0);
+	//pthread_mutex_unlock(&wl_mutex);
+	// Flush and dispatch using the correct wl_display
+    struct wl_display *wl_disp = display_get_display(window_get_display(background->window));
+	   //pthread_t thread;
+	
+	wl_display_flush(wl_disp);
+	
+	//wl_display_dispatch(wl_disp);
+	   //pthread_create(&thread, NULL, event_loop_thread, wl_disp);
+    //struct wl_buffer *buffer = zwp_linux_buffer_params_v1_create(params, width, height, DRM_FORMAT_XRGB8888, 0);
+    //if (!buffer) { fprintf(stderr, "Failed to create wl_buffer"); close(dma_fd); gbm_bo_destroy(bo); gbm_device_destroy(gbm); close(drm_fd); return; }
+
+    //wl_surface_attach(window_get_wl_surface(background->window), buffer, 0, 0);
+    //wl_surface_damage(window_get_wl_surface(background->window), 0, 0, width, height);
+    //wl_surface_commit(window_get_wl_surface(background->window));
+	cleanup:
+    close(dma_fd);
+    gbm_bo_destroy(bo);
+    gbm_device_destroy(gbm);
+    close(drm_fd);
+
+    background->painted = 1;
+    check_desktop_ready(background->window);
 }
 
 static void
@@ -1166,7 +1265,7 @@ background_destroy(struct background *background)
 }
 
 static struct background *
-background_create(struct desktop *desktop, struct output *output)
+background_create(struct desktop *desktop, struct output *output)//remove widget based shmem buffer creation.
 {
 	struct background *background;
 	struct weston_config_section *s;
@@ -1178,7 +1277,9 @@ background_create(struct desktop *desktop, struct output *output)
 	background->window = window_create_custom(desktop->display);
 	background->widget = window_add_widget(background->window, background);
 	window_set_user_data(background->window, background);
+	fprintf(stderr, "calling widget_set_redraw_handler(bg_draw)\n");
 	widget_set_redraw_handler(background->widget, background_draw);
+	fprintf(stderr, "return from widget_set_redraw_handler(bg_draw)\n");
 	widget_set_transparent(background->widget, 0);
 
 	s = weston_config_get_section(desktop->config, "shell", NULL, NULL);
@@ -1577,6 +1678,29 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
+
+    //create dmabuf global
+	/* Bind zwp_linux_dmabuf_v1 from registry */
+	/*static struct zwp_linux_dmabuf_v1 *dmabuf_global = NULL;
+
+	static void registry_handler(void *data, struct wl_registry *registry,
+								uint32_t id, const char *interface, uint32_t version) {
+		if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+			dmabuf_global = wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, 3);
+		}
+	}
+
+	static const struct wl_registry_listener registry_listener = {
+		registry_handler,
+		NULL
+	};
+
+	struct wl_registry *registry = wl_display_get_registry(display_get_wl_display(desktop.display));
+	wl_registry_add_listener(registry, &registry_listener, NULL);
+	wl_display_roundtrip(display_get_wl_display(desktop.display));*/
+
+
+
 	display_set_user_data(desktop.display, &desktop);
 	display_set_global_handler(desktop.display, global_handler);
 	display_set_global_handler_remove(desktop.display, global_handler_remove);
@@ -1593,6 +1717,17 @@ int main(int argc, char *argv[])
 
 	signal(SIGCHLD, sigchild_handler);
 
+	
+	struct wl_display *display = wl_display_connect(NULL);
+	struct wl_registry *registry = wl_display_get_registry(display);
+
+	// Attach the listener
+	wl_registry_add_listener(registry, &registry_listener, NULL);
+
+	// Roundtrip to ensure globals are received
+	wl_display_roundtrip(display);
+
+
 	display_run(desktop.display);
 
 	/* Cleanup */
@@ -1606,3 +1741,92 @@ int main(int argc, char *argv[])
 
 	return 0;
 }
+
+/*static void
+background_draw(struct widget *widget, void *data)
+{
+	struct background *background = data;
+	cairo_surface_t *surface, *image;
+	cairo_pattern_t *pattern;
+	cairo_matrix_t matrix;
+	cairo_t *cr;
+	double im_w, im_h;
+	double sx, sy, s;
+	double tx, ty;
+	struct rectangle allocation;
+
+	surface = window_get_surface(background->window);
+
+	cr = widget_cairo_create(background->widget);
+	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+	if (background->color == 0)
+		cairo_set_source_rgba(cr, 0.0, 0.0, 0.2, 1.0);
+	else
+		set_hex_color(cr, background->color);
+	cairo_paint(cr);
+
+	widget_get_allocation(widget, &allocation);
+	image = NULL;
+	if (background->image)
+		image = load_cairo_surface(background->image);
+	else if (background->color == 0) {
+		char *name = file_name_with_datadir("pattern.png");
+
+		image = load_cairo_surface(name);
+		free(name);
+	}
+
+	if (image && background->type != -1) {
+		im_w = cairo_image_surface_get_width(image);
+		im_h = cairo_image_surface_get_height(image);
+		sx = im_w / allocation.width;
+		sy = im_h / allocation.height;
+
+		pattern = cairo_pattern_create_for_surface(image);
+
+		switch (background->type) {
+		case BACKGROUND_SCALE:
+			cairo_matrix_init_scale(&matrix, sx, sy);
+			cairo_pattern_set_matrix(pattern, &matrix);
+			cairo_pattern_set_extend(pattern, CAIRO_EXTEND_PAD);
+			break;
+		case BACKGROUND_SCALE_CROP:
+			s = (sx < sy) ? sx : sy;
+			 //align center 
+			tx = (im_w - s * allocation.width) * 0.5;
+			ty = (im_h - s * allocation.height) * 0.5;
+			cairo_matrix_init_translate(&matrix, tx, ty);
+			cairo_matrix_scale(&matrix, s, s);
+			cairo_pattern_set_matrix(pattern, &matrix);
+			cairo_pattern_set_extend(pattern, CAIRO_EXTEND_PAD);
+			break;
+		case BACKGROUND_TILE:
+			cairo_pattern_set_extend(pattern, CAIRO_EXTEND_REPEAT);
+			break;
+		case BACKGROUND_CENTERED:
+			s = (sx < sy) ? sx : sy;
+			if (s < 1.0)
+				s = 1.0;
+
+			// align center
+			tx = (im_w - s * allocation.width) * 0.5;
+			ty = (im_h - s * allocation.height) * 0.5;
+
+			cairo_matrix_init_translate(&matrix, tx, ty);
+			cairo_matrix_scale(&matrix, s, s);
+			cairo_pattern_set_matrix(pattern, &matrix);
+			break;
+		}
+
+		cairo_set_source(cr, pattern);
+		cairo_pattern_destroy (pattern);
+		cairo_surface_destroy(image);
+		cairo_mask(cr, pattern);
+	}
+
+	cairo_destroy(cr);
+	cairo_surface_destroy(surface);
+
+	background->painted = 1;
+	check_desktop_ready(background->window);
+}*/

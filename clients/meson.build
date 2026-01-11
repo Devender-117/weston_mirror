@@ -389,12 +389,14 @@ if get_option('shell-desktop')
 	exe_shell_desktop = executable(
 		'weston-desktop-shell',
 		'desktop-shell.c',
+		linux_dmabuf_unstable_v1_client_protocol_h,
+		linux_dmabuf_unstable_v1_protocol_c,
 		weston_desktop_shell_client_protocol_h,
 		weston_desktop_shell_protocol_c,
 		tablet_unstable_v2_client_protocol_h,
 		tablet_unstable_v2_protocol_c,
 		include_directories: common_inc,
-		dependencies: dep_toytoolkit,
+                dependencies: [dep_toytoolkit, dependency('gbm'), dependency('libdrm'), dependency('wayland-protocols')],
 		install_dir: get_option('libexecdir'),
 		install: true
 	)
